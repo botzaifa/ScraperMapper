@@ -5,3 +5,5 @@ lxml
 xlsxwriter
 requests
 pixelbin
+qrcode[pil]
+pillow

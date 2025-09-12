@@ -7,6 +7,9 @@ from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from pixelbin import PixelbinClient, PixelbinConfig
 from pixelbin.utils.url import url_to_obj, obj_to_url
+import qrcode
+from PIL import Image
+import io
 
 # =========================================================
 # COMMON HELPERS
@@ -156,12 +159,13 @@ def download_with_poll(url, filename, max_retries=12, wait_seconds=1.0):
 # =========================================================
 
 def extract_bayut_fields(html: str) -> dict:
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     lds  = _jsonlds(soup)
     res  = _get_residence(lds)
 
     row = {
         "Property Name*": "",
+        # "Developer Name": "",
         "Seller Name*": "",
         "Property Type*": "",
         "Description": "",
@@ -187,14 +191,17 @@ def extract_bayut_fields(html: str) -> dict:
         "Furnishing Status*": "",
         "Year Build": "",
         "Reference Number": "",
+        
         # Regulatory
         "Permit Number": "",
+        "Trakheesi Permit Link": "",
         "BRN": "",
         "DED": "",
         "RERA": "",
         "Zone Name": "",
         "Registered Agency": "",
         "ARRA": "",
+
     }
 
     # Property Name
@@ -219,15 +226,11 @@ def extract_bayut_fields(html: str) -> dict:
 
     # Beds / Baths / Area from JSON-LD (fallbacks)
     if res:
-        # safety: some schemas store numbers differently
-        try:
-            row["Bedrooms*"] = str((res.get("numberOfRooms") or {}).get("value", "")) or row["Bedrooms*"]
-        except Exception:
-            row["Bedrooms*"] = row["Bedrooms*"]
+        row["Bedrooms*"] = str((res.get("numberOfRooms") or {}).get("value", "")) or row["Bedrooms*"]
         row["Bathrooms*"] = str(res.get("numberOfBathroomsTotal", "")) or row["Bathrooms*"]
         row["Property Area*"] = str((res.get("floorSize") or {}).get("value", "")) or row["Property Area*"]
 
-    # ---------- SPECIFIC MAPPING FOR Beds / Baths / Area ----------
+    # ---------- SPECIFIC MAPPING FOR Beds / Baths / Area (FROM THE ELEMENT YOU SHARED) ----------
     def _grab_feature(label_regex: str) -> str:
         el = soup.find("span", {"aria-label": re.compile(label_regex, re.I)})
         if not el:
@@ -243,7 +246,6 @@ def extract_bayut_fields(html: str) -> dict:
     if baths: row["Bathrooms*"]     = baths       
     if area:  row["Property Area*"] = area        
 
-    # --- Other specs
     for spec in soup.find_all("span", {"aria-label": True}):
         label = spec["aria-label"].strip().lower()
         inner_val = spec.find("span", class_="_3458a9d4")
@@ -265,35 +267,35 @@ def extract_bayut_fields(html: str) -> dict:
             elif re.match(r"\d{4}", val):
                 row["Handover Date (Year)"] = val
 
-    # Price (from JSON-LD offers)
+    # Price
     for o in lds:
-        if isinstance(o, dict) and o.get("@type") == "ItemPage" and isinstance(o.get("mainEntity"), dict):
+        if o.get("@type") == "ItemPage" and isinstance(o.get("mainEntity"), dict):
             offers = o["mainEntity"].get("offers") or []
             if isinstance(offers, list) and offers:
-                ps = offers[0].get("priceSpecification", {}) or offers[0]
-                row["Purchase Price*"] = ps.get("price", "") or ps.get("priceCurrency", "") or row["Purchase Price*"]
+                ps = offers[0].get("priceSpecification", {})
+                row["Purchase Price*"] = ps.get("price", "")
 
-    # Property Type (regex fallback)
-    m = re.search(r'"property_type"\s*:\s*"([^"]+)"', html or "", re.I)
+    # Property Type
+    m = re.search(r'"property_type"\s*:\s*"([^"]+)"', html, re.I)
     if m:
         row["Property Type*"] = m.group(1).rstrip("s").title()
 
-    # Seller Name (from offers.offeredBy)
+    # Seller Name
     for o in lds:
-        if isinstance(o, dict) and o.get("@type") == "ItemPage":
+        if o.get("@type") == "ItemPage":
             me = o.get("mainEntity") or {}
             off = (me.get("offers") or [{}])[0]
             offeredBy = off.get("offeredBy") or {}
             org = offeredBy.get("parentOrganization") or {}
-            row["Seller Name*"] = _first(org.get("name",""), offeredBy.get("name",""), row["Seller Name*"])
+            row["Seller Name*"] = _first(org.get("name",""), offeredBy.get("name",""))
 
     # Completion Status
-    m = re.search(r'"completion_status"\s*:\s*"([^"]+)"', html or "", re.I)
+    m = re.search(r'"completion_status"\s*:\s*"([^"]+)"', html, re.I)
     if m:
         row["Completion Status*"] = m.group(1).replace("-", " ").title()
 
     # Instant Buy rule
-    if row["Completion Status*"] and row["Completion Status*"].lower() == "under construction":
+    if row["Completion Status*"].lower() == "under construction":
         row["Instant Buy"] = ""
     else:
         row["Instant Buy"] = "Yes"
@@ -306,7 +308,7 @@ def extract_bayut_fields(html: str) -> dict:
             val = val.split()[-1]
         row["Furnishing Status*"] = val
 
-    # ✅ Extended Regulatory info (resilient selectors)
+    # Regulatory info
     for li in soup.select("ul._7d2126bd li"):
         label_el = li.find("div", class_="_52bcc5bc")
         value_el = li.find("span", class_="_677f9d24")
@@ -331,7 +333,13 @@ def extract_bayut_fields(html: str) -> dict:
         elif label == "brn":
             row["BRN"] = value
 
-    # Lat/Lon from JSON-LD
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(" ", strip=True)
+        if re.search(r"Trakheesi Permit", text, re.I):
+            row["Trakheesi Permit Link"] = a["href"]
+            break
+
+    # Lat/Lon
     if res and isinstance(res.get("geo"), dict):
         row["Latitude"] = str(res["geo"].get("latitude",""))
         row["Longitude"] = str(res["geo"].get("longitude",""))
@@ -369,7 +377,7 @@ def extract_gallery_images_bayut(raw_html: str):
 # =========================================================
 
 def extract_propertyfinder_fields(html: str) -> dict:
-    soup = BeautifulSoup(html or "", "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
     row = {
         "Property Name*": "",
@@ -399,15 +407,16 @@ def extract_propertyfinder_fields(html: str) -> dict:
         "Furnishing Status*": "",
         "Year Build": "",
         "Reference Number": "",
+        
         # Regulatory
         "Permit Number": "",
+        "Trakheesi Permit": "",
         "BRN": "",
         "DED": "",
         "RERA": "",
         "Zone Name": "",
         "Registered Agency": "",
         "ARRA": "",
-        "Trakheesi Permit": "",
     }
 
     # ---------------- PROPERTY NAME ----------------
@@ -458,23 +467,24 @@ def extract_propertyfinder_fields(html: str) -> dict:
 
     # ---------------- JSON-LD (LAT/LON + LOCATION) ----------------
     script_tag = soup.find("script", {"id": "plp-schema", "type": "application/ld+json"})
-    if script_tag and script_tag.string:
+    if script_tag:
         try:
             data = json.loads(script_tag.string)
-            main_entity = data.get("mainEntity", {}).get("mainEntity", {}) if isinstance(data, dict) else {}
+            main_entity = data.get("mainEntity", {}).get("mainEntity", {})
+
             # GEO
-            geo = (main_entity or {}).get("geo", {}) or data.get("geo", {})
+            geo = main_entity.get("geo", {})
             if geo:
                 row["Latitude"] = str(geo.get("latitude", ""))
                 row["Longitude"] = str(geo.get("longitude", ""))
                 if row["Latitude"] and row["Longitude"]:
                     row["Google Map URL*"] = f"https://www.google.com/maps?q={row['Latitude']},{row['Longitude']}"
+
             # LOCATION
-            address = (main_entity or {}).get("address", {}) or data.get("address", {})
+            address = main_entity.get("address", {})
             if isinstance(address, dict):
-                row["Location"] = address.get("name", "") or address.get("streetAddress", "") or row["Location"]
+                row["Location"] = address.get("name", "")
         except Exception as e:
-            # don't crash the app on JSON parse errors
             print("Error parsing JSON-LD:", e)
 
     # ---------------- REGULATORY INFO ----------------
@@ -514,12 +524,18 @@ def extract_propertyfinder_fields(html: str) -> dict:
             if next_val:
                 row["Zone Name"] = next_val.get_text(strip=True)
 
-    # ---------------- TRAKHEESI PERMIT (QR link) ----------------
+    # ---------------- TRAKHEESI PERMIT (resolve redirect) ----------------
     qr_div = soup.find("div", {"data-testid": "property-regulatory-qr-code"})
     if qr_div:
         link = qr_div.find("a", href=True)
         if link:
-            row["Trakheesi Permit"] = link["href"]
+            raw_url = link["href"]
+            try:
+                response = requests.get(raw_url, allow_redirects=True, timeout=10)
+                row["Trakheesi Permit"] = response.url  
+            except Exception as e:
+                print("Error resolving Trakheesi link:", e)
+                row["Trakheesi Permit"] = raw_url  
 
     # ---------------- DEVELOPER NAME ----------------
     if row.get("Registered Agency"):
@@ -709,27 +725,57 @@ def watermark_ui_and_process(gallery):
 
 
 if platform == "Bayut":
-    uploaded = st.file_uploader("Upload Bayut HTML (.txt / .html)", type=["txt","html"])
-    if uploaded:
-        raw = uploaded.read().decode("utf-8", errors="ignore")
-        fields = extract_bayut_fields(raw)
-        st.subheader("Extracted Property Fields")
+    uploaded_file = st.file_uploader("Upload saved Bayut .txt file", type=["txt","html"])
+    if uploaded_file:
+        html = uploaded_file.read().decode("utf-8", errors="ignore")
+
+        # --- Text fields ---
+        fields = extract_bayut_fields(html)
+        st.subheader("Extracted Property Fields:")
         st.json(fields)
 
-        df = pd.DataFrame([fields])
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False)
-        output.seek(0)
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=output.getvalue(),
-            file_name="bayut_property.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # ✅ Trakheesi QR Code if link exists
+        trakheesi_url = fields.get("Trakheesi Permit Link")
+        if trakheesi_url:
+            st.subheader("Trakheesi QR Code")
+            try:
+                logo_img = Image.open("trakheesi-logo.png")
+            except FileNotFoundError:
+                st.warning("Logo file 'trakheesi-logo.png' not found. Showing QR without logo.")
+                logo_img = None
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=10,
+                border=1,
+            )
+            qr.add_data(trakheesi_url)
+            qr.make(fit=True)
+
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+            if logo_img:
+                qr_width, qr_height = qr_img.size
+                logo_size = min(qr_width, qr_height) // 5
+                logo_img = logo_img.resize((logo_size, logo_size))
+                logo_position = ((qr_width - logo_size) // 2, (qr_height - logo_size) // 2)
+                qr_img.paste(logo_img, logo_position, logo_img.convert("RGBA"))
+
+            img_bytes = io.BytesIO()
+            qr_img.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+
+            st.image(img_bytes, caption="Trakheesi QR Code", width=300)
+            st.download_button(
+                label="⬇️ Download Trakheesi QR Code",
+                data=img_bytes,
+                file_name="Trakheesi-QR_Code.png",
+                mime="image/png",
+            )
 
         # Gallery extraction (unchanged)
-        gallery = extract_gallery_images_bayut(raw)
+        gallery = extract_gallery_images_bayut(html)
         st.subheader(f"Gallery images found: {len(gallery)}")
         if gallery:
             st.image(gallery[:5], width=120)
@@ -741,25 +787,54 @@ if platform == "Bayut":
 elif platform == "PropertyFinder":
     uploaded = st.file_uploader("Upload PropertyFinder HTML (.txt / .html)", type=["txt","html"])
     if uploaded:
-        raw = uploaded.read().decode("utf-8", errors="ignore")
-        fields = extract_propertyfinder_fields(raw)
-        st.subheader("Extracted Property Fields")
+        html = uploaded.read().decode("utf-8", errors="ignore")
+
+        fields = extract_propertyfinder_fields(html)
+        st.subheader("📑 Extracted Property Fields")
         st.json(fields)
 
-        df = pd.DataFrame([fields])
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False)
-        output.seek(0)
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=output.getvalue(),
-            file_name="propertyfinder_property.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # ✅ Generate QR Code if Trakheesi Permit link exists
+        trakheesi_url = fields.get("Trakheesi Permit")
+        if trakheesi_url:
+            st.subheader("Trakheesi QR Code")
+            try:
+                logo_img = Image.open("trakheesi-logo.png")
+            except FileNotFoundError:
+                st.warning("Logo file 'trakheesi-logo.png' not found. Showing QR without logo.")
+                logo_img = None
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=10,
+                border=1,
+            )
+            qr.add_data(trakheesi_url)
+            qr.make(fit=True)
+
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+            if logo_img:
+                qr_width, qr_height = qr_img.size
+                logo_size = min(qr_width, qr_height) // 5
+                logo_img = logo_img.resize((logo_size, logo_size))
+                logo_position = ((qr_width - logo_size) // 2, (qr_height - logo_size) // 2)
+                qr_img.paste(logo_img, logo_position, logo_img.convert("RGBA"))
+
+            img_bytes = io.BytesIO()
+            qr_img.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+
+            st.image(img_bytes, caption="Trakheesi QR Code", width=300)
+            st.download_button(
+                label="⬇️ Download Trakheesi QR Code",
+                data=img_bytes,
+                file_name="Trakheesi-QR_Code.png",
+                mime="image/png",
+            )
 
         # Gallery extraction (unchanged)
-        gallery = extract_gallery_images_propertyfinder(raw)
+        gallery = extract_gallery_images_propertyfinder(html)
         st.subheader(f"Gallery images found: {len(gallery)}")
         if gallery:
             st.image(gallery[:5], width=120)
